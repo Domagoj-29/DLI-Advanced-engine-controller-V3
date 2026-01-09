@@ -4,22 +4,23 @@
 
 -- onTick functions
 
-local function pid(p,i,d)
-	return {
-		p=p,i=i,d=d,
-		E=0,D=0,I=0,
-		run = function(s,sp,pv)
-		local E=sp-pv
-		local D=E-s.E
-		s.E=E
-		if math.abs(E)<2 then
-			s.I=s.I+E*s.i
-		else
-			s.I=s.I*0.9
+local function createPID()
+	local oldError=0
+	local integral=0
+	return function(setpoint,processVariable,P,I,D,active)
+		if not active then
+			oldError=0
+			integral=0
+			return 0
 		end
-		local output=E*s.p+s.I+D*s.d
-		return math.max(0,math.min(output,1))
-	end }
+
+		local error=setpoint-processVariable
+		local derivative=error-oldError
+		oldError=error
+		integral=integral+error*I
+
+		return error*P+integral+derivative*D
+	end
 end
 local function linearInterpolation(x,x1,x2,y1,y2)
 	return y1+((x-x1)*(y2-y1)/(x2-x1))
@@ -49,11 +50,28 @@ local function createUpDown(startValue)
 		return counter
 	end
 end
-local pid1=pid(0.8,0,0)
-deltaBatteryCharge=createDelta()
-upDownAFR=createUpDown(0.5)
-upDownAlternator=createUpDown(0)
-upDownDynamicThrottle=createUpDown(0)
+
+local idlePID=createPID()
+local deltaBatteryCharge=createDelta()
+local upDownAFR=createUpDown(0.5)
+local upDownAlternator=createUpDown(0)
+local upDownDynamicThrottle=createUpDown(0)
+
+MaxRPS=property.getNumber("RPS limiter")
+ManualLimiterSensitivity=property.getNumber("RPS limiter sensitivity")
+MinimumIdleRPS=property.getNumber("Idle RPS")
+MaxClutchRPS=property.getNumber("RPS to fully engage the clutch")
+OverheatingProtectionThreshold=property.getNumber("Overheating protection threshold")
+MaxFluidPumpTemperature=property.getNumber("Temperature to fully engage the fluid pump")
+RadiatorFanTemperatureThreshold=property.getNumber("Radiator fan activation temperature")
+MaxBatteryCharge=property.getNumber("Max battery charge")
+MinThrottle=property.getNumber("Min throttle")
+MaxThrottle=property.getNumber("Max throttle")
+
+DynamicIdleRPS=property.getBool("Dynamic idle RPS")
+
+IdleRPS=MinimumIdleRPS
+
 function onTick()
 	local air=input.getNumber(1)
 	local fuel=input.getNumber(2)
@@ -62,33 +80,20 @@ function onTick()
 	local crankshaftRPS=input.getNumber(5)
 	local batteryCharge=input.getNumber(6)
 
-	local maxRPS=property.getNumber("RPS limiter")
-	local manualLimiterSensitivity=property.getNumber("RPS limiter sensitivity")
-	local idleRPS=property.getNumber("Idle RPS")
-	local maxClutchRPS=property.getNumber("RPS to fully engage the clutch")
-	local overheatingProtectionThreshold=property.getNumber("Overheating protection threshold")
-	local maxFluidPumpTemperature=property.getNumber("Temperature to fully engage the fluid pump")
-	local radiatorFanTemperatureThreshold=property.getNumber("Radiator fan activation temperature")
-	local maxBatteryCharge=property.getNumber("Max battery charge")
-	local minThrottle=property.getNumber("Min throttle")
-	local maxThrottle=property.getNumber("Max throttle")
-
 	local engine=input.getBool(1)
 
-	local dynamicIdleRPS=property.getBool("Dynamic idle RPS")
-
-	if engine and engineTemperature<overheatingProtectionThreshold then
-		if dynamicIdleRPS then
-			idleRPS=idleRPS+upDownDynamicThrottle(batteryCharge>maxBatteryCharge-0.003,batteryCharge<maxBatteryCharge-0.004 and deltaBatteryCharge(batteryCharge)<0.0000001,0.01,0,maxRPS-idleRPS)
+	if engine and engineTemperature<OverheatingProtectionThreshold then
+		if DynamicIdleRPS then
+			IdleRPS=MinimumIdleRPS+upDownDynamicThrottle(batteryCharge>MaxBatteryCharge-0.003,batteryCharge<MaxBatteryCharge-0.004 and deltaBatteryCharge(batteryCharge)<0.0000001,0.01,0,MaxRPS-IdleRPS)
 		end
 
-		local idleThrottle=pid1:run(idleRPS,crankshaftRPS)
+		local idleThrottle=idlePID(IdleRPS,crankshaftRPS,0.8,0,0,true)
 
-		throttle=clamp(linearInterpolation(throttle,minThrottle,maxThrottle,0,1),0,1)
+		throttle=clamp(linearInterpolation(throttle,MinThrottle,MaxThrottle,0,1),0,1)
 		engineThrottle=((throttle<0.2) and idleThrottle or throttle)
 
-		local limiterSensitivity=(manualLimiterSensitivity==0) and maxRPS or manualLimiterSensitivity
-		local airManifold=engineThrottle/(clamp((2+0.2*limiterSensitivity)^(crankshaftRPS-maxRPS),1,100))
+		local limiterSensitivity=(ManualLimiterSensitivity==0) and MaxRPS or ManualLimiterSensitivity
+		local airManifold=engineThrottle/(clamp((2+0.2*limiterSensitivity)^(crankshaftRPS-MaxRPS),1,100))
 
 		local realAFR=air/fuel
 		local stoichiometryFormula=clamp(engineTemperature*0.004,0,0.4)
@@ -97,12 +102,12 @@ function onTick()
 
 		local starter=crankshaftRPS<2.1
 
-		local clutch=((crankshaftRPS<2.1 or throttle<0.05) and 0 or crankshaftRPS*(1/maxClutchRPS))
+		local clutch=((crankshaftRPS<2.1 or throttle<0.05) and 0 or crankshaftRPS*(1/MaxClutchRPS))
 
-		local fluidPump=clamp(engineTemperature*(1/maxFluidPumpTemperature),0,1)
-		local radiatorFan=engineTemperature>radiatorFanTemperatureThreshold
+		local fluidPump=clamp(engineTemperature*(1/MaxFluidPumpTemperature),0,1)
+		local radiatorFan=engineTemperature>RadiatorFanTemperatureThreshold
 
-		local alternator=upDownAlternator(batteryCharge>maxBatteryCharge-0.003,batteryCharge<maxBatteryCharge-0.004,0.01,0,1)
+		local alternator=upDownAlternator(batteryCharge>MaxBatteryCharge-0.003,batteryCharge<MaxBatteryCharge-0.004,0.01,0,1)
 
 		output.setNumber(1,airManifold)
 		output.setNumber(2,fuelManifold)
@@ -113,6 +118,8 @@ function onTick()
 		output.setBool(1,starter)
 		output.setBool(2,radiatorFan)
 	else
+		idlePID(0,0,0,0,0,false)
+
 		output.setNumber(1,0)
 		output.setNumber(2,0)
 		output.setNumber(3,0)
