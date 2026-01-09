@@ -17,7 +17,11 @@ local function createPID()
 		local error=setpoint-processVariable
 		local derivative=error-oldError
 		oldError=error
-		integral=integral+error*I
+		if math.abs(error)<2 then
+			integral=integral+error*I
+		else
+			integral=integral*0.9
+		end
 
 		return error*P+integral+derivative*D
 	end
